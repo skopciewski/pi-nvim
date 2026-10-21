@@ -1,8 +1,9 @@
 local M = {}
+local paths = require("pi-nvim.paths")
 
 --- Session discovery contract (shared with the pi extension):
 --- each pi session listens on `<dir>/<hash>-<pid>-<random>.sock` and writes a
---- JSON manifest `<socket>.info` ({ socket, cwd, pid, startedAt })
+--- JSON manifest `<socket>.info` ({ socket, cwd, projectRoot, pid, startedAt })
 --- next to it. `<dir>` is `<project root>/tmp` when that directory exists,
 --- otherwise the global directory below. The project root is the nearest
 --- ancestor of the cwd containing `.git`, falling back to the cwd.
@@ -111,14 +112,14 @@ end
 --- @param cwd string
 --- @return string
 local function project_root(cwd)
-  return vim.fs.root(cwd, ".git") or cwd
+  return paths.project_root(cwd)
 end
 
 --- @param root string
 --- @param path string|nil
 --- @return boolean
 local function within(root, path)
-  return path ~= nil and (path == root or path:sub(1, #root + 1) == root .. "/")
+  return paths.within(root, path)
 end
 
 --- @param path string
@@ -139,38 +140,48 @@ end
 --- @class pi_nvim.Session
 --- @field socket string   Connect address (derived from where the manifest was found)
 --- @field cwd string|nil
+--- @field project_root string|nil
+--- @field local_root string|nil
+--- @field remote_root string|nil
 --- @field pid integer|nil
 --- @field started_at string|nil
---- @field mtime number
+--- @field mtime number|nil
+
+local function read_session(socket)
+  local stat = vim.uv.fs_stat(socket)
+  if not stat or stat.type ~= "socket" then return nil end
+  local read_ok, lines = pcall(vim.fn.readfile, socket .. ".info")
+  if not read_ok or not lines[1] then return nil end
+  local parse_ok, info = pcall(vim.json.decode, lines[1])
+  if not parse_ok or type(info) ~= "table" then return nil end
+  local root = typed(info.projectRoot, "string")
+  if root and root:sub(1, 1) ~= "/" then root = nil end
+  local local_root, remote_root = paths.session_roots(socket, info, M._global_dir, project_root(vim.fn.getcwd()))
+  return {
+    socket = socket,
+    cwd = typed(info.cwd, "string"),
+    project_root = root and vim.fs.normalize(root, { expand_env = false }),
+    local_root = local_root,
+    remote_root = remote_root,
+    pid = typed(info.pid, "number"),
+    started_at = typed(info.startedAt, "string"),
+    mtime = stat.mtime.sec + stat.mtime.nsec / 1e9,
+  }
+end
 
 --- Read the sessions registered in dir whose socket file exists.
 --- @param dir string
 --- @return pi_nvim.Session[]
 local function read_sessions(dir)
   local sessions = {}
-  if not vim.uv.fs_stat(dir) then return sessions end
-  for name, kind in vim.fs.dir(dir) do
+  local scan = vim.uv.fs_scandir(dir)
+  if not scan then return sessions end
+  while true do
+    local name, kind = vim.uv.fs_scandir_next(scan)
+    if not name then break end
     if kind == "file" and name:sub(-10) == ".sock.info" then
-      local socket = dir .. "/" .. name:sub(1, -6)
-      local stat = vim.uv.fs_stat(socket)
-      if stat and stat.type == "socket" then
-        local read_ok, lines = pcall(vim.fn.readfile, dir .. "/" .. name)
-        local parse_ok, info = false, nil
-        if read_ok and lines[1] then
-          parse_ok, info = pcall(vim.json.decode, lines[1])
-        end
-        if parse_ok and type(info) == "table" then
-          -- Fields of the wrong type are dropped; a session without a cwd
-          -- never matches a project in the global directory.
-          table.insert(sessions, {
-            socket = socket,
-            cwd = typed(info.cwd, "string"),
-            pid = typed(info.pid, "number"),
-            started_at = typed(info.startedAt, "string"),
-            mtime = stat.mtime.sec + stat.mtime.nsec / 1e9,
-          })
-        end
-      end
+      local session = read_session(dir .. "/" .. name:sub(1, -6))
+      if session then table.insert(sessions, session) end
     end
   end
   table.sort(sessions, function(a, b) return a.mtime > b.mtime end)
@@ -186,7 +197,11 @@ local function discover(root)
   local local_sessions = read_sessions(root .. "/tmp")
   if local_sessions[1] then return local_sessions[1].socket end
   for _, session in ipairs(read_sessions(M._global_dir)) do
-    if within(root, session.cwd) then return session.socket end
+    if session.project_root then
+      if paths.canonical(session.project_root) == root then return session.socket end
+    elseif within(root, paths.canonical(session.cwd)) then
+      return session.socket
+    end
   end
   return nil
 end
@@ -205,7 +220,7 @@ function M.get_socket_path()
     M.state.pinned = nil
   end
 
-  local cwd = vim.uv.cwd()
+  local cwd = paths.canonical(vim.fn.getcwd())
   local cache = M.state.cache
   if cache and cache.cwd == cwd and cache.fingerprint == fingerprint(cache.root) then
     return cache.socket
@@ -217,6 +232,13 @@ function M.get_socket_path()
   local socket = discover(root)
   M.state.cache = { cwd = cwd, root = root, fingerprint = fp, socket = socket }
   return socket
+end
+
+--- @return pi_nvim.Session|nil
+function M.get_session()
+  local socket = M.get_socket_path()
+  if not socket then return nil end
+  return read_session(socket) or { socket = socket }
 end
 
 --- Drop a socket that failed to connect so the next lookup rediscovers.
@@ -251,13 +273,29 @@ local function forget(socket, err, refused)
 end
 
 --- Send a raw JSON message to the pi socket and call cb with the parsed response.
---- @param msg table
+--- @param msg table|fun(session: pi_nvim.Session): table|nil, string|nil
 --- @param cb fun(err: string|nil, response: table|nil)|nil
 --- @param _retried boolean|nil  internal: a failed connect is retried once
 function M.send_raw(msg, cb, _retried)
-  local sock_path = M.get_socket_path()
-  if not sock_path then
-    local err = "No pi session found. Is pi running with pi-nvim extension?"
+  local session = M.get_session()
+  if not session then
+    local err = "No pi session found. Start pi with the pi-nvim extension and create <checkout>/tmp before starting pi in a container."
+    vim.notify(err, vim.log.levels.ERROR)
+    if cb then cb(err, nil) end
+    return
+  end
+
+  local sock_path = session.socket
+  local request, build_err = msg, nil
+  if type(msg) == "function" then request, build_err = msg(session) end
+  if not request then
+    local err = build_err or "Nothing to send"
+    vim.notify(err, vim.log.levels.ERROR)
+    if cb then cb(err, nil) end
+    return
+  end
+  if #sock_path > 107 then
+    local err = "pi socket path exceeds the 107-byte Unix socket limit on the Neovim side: " .. sock_path
     vim.notify(err, vim.log.levels.ERROR)
     if cb then cb(err, nil) end
     return
@@ -287,7 +325,7 @@ function M.send_raw(msg, cb, _retried)
       return
     end
 
-    local payload = vim.json.encode(msg) .. "\n"
+    local payload = vim.json.encode(request) .. "\n"
     client:write(payload)
 
     local buf = ""
@@ -295,6 +333,7 @@ function M.send_raw(msg, cb, _retried)
       if read_err then
         client:close()
         vim.schedule(function()
+          vim.notify("Failed to read from pi: " .. read_err, vim.log.levels.ERROR)
           if cb then cb(read_err, nil) end
         end)
         return
@@ -311,78 +350,69 @@ function M.send_raw(msg, cb, _retried)
             if ok and resp then
               if cb then cb(nil, resp) end
             else
+              vim.notify("Invalid response from pi", vim.log.levels.ERROR)
               if cb then cb("Invalid response from pi", nil) end
             end
           end)
         end
       else
-        -- EOF
         client:close()
+        vim.schedule(function()
+          local err = "pi closed the connection without a response"
+          vim.notify(err, vim.log.levels.ERROR)
+          if cb then cb(err, nil) end
+        end)
       end
     end)
   end)
 end
 
---- Send a prompt string to pi.
---- @param message string|nil  If nil, prompts the user for input
-function M.prompt(message)
+--- Send a prompt through the selected session's socket.
+--- @param message string|fun(session: pi_nvim.Session): string|nil, string|nil
+--- @param on_result fun(err: string|nil, response: table|nil)|nil
+function M.prompt(message, on_result)
   if message then
-    -- Check for a running pi terminal buffer
-    local term_buf = nil
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "terminal" then
-        local name = vim.api.nvim_buf_get_name(buf)
-        -- Match ":pi" or ":pi " at the end/middle of the term name
-        if name:lower():match(":pi$") or name:lower():match(":pi%s") then
-          term_buf = buf
-          break
-        end
+    local request = { type = "prompt", message = message }
+    if type(message) == "function" then
+      request = function(session)
+        local text, err = message(session)
+        if not text then return nil, err end
+        return { type = "prompt", message = text }
       end
     end
-
-    if term_buf then
-      local id = vim.b[term_buf].terminal_job_id
-      if id then
-        -- Focus or open the terminal window
-        local win = vim.fn.bufwinid(term_buf)
-        if win ~= -1 then
-          vim.api.nvim_set_current_win(win)
+    M.send_raw(request, function(err, resp)
+      if not err then
+        if resp and resp.ok then
+          vim.notify("Sent to pi", vim.log.levels.INFO)
         else
-          vim.cmd("botright split")
-          vim.api.nvim_win_set_buf(0, term_buf)
+          err = "pi error: " .. (resp and resp.error or "unknown")
+          vim.notify(err, vim.log.levels.ERROR)
         end
-
-        -- Send via bracketed paste to handle newlines correctly, and append \r to submit
-        local payload = "\x1b[200~" .. message .. "\x1b[201~\r"
-        vim.api.nvim_chan_send(id, payload)
-        vim.cmd("startinsert")
-        
-        vim.notify("Sent to pi terminal buffer", vim.log.levels.INFO)
-        return
       end
-    end
-
-    M.send_raw({ type = "prompt", message = message }, function(err, resp)
-      if err then return end
-      if resp and resp.ok then
-        vim.notify("Sent to pi", vim.log.levels.INFO)
-      else
-        vim.notify("pi error: " .. (resp and resp.error or "unknown"), vim.log.levels.ERROR)
-      end
+      if on_result then on_result(err, resp) end
     end)
   else
     vim.ui.input({ prompt = "Pi prompt: " }, function(input)
       if input and input ~= "" then
-        M.prompt(input)
+        M.prompt(input, on_result)
       end
     end)
   end
 end
 
+--- Build file context after selecting the target, including on connection retries.
+function M.send_file_context(source, build_message, on_result)
+  M.prompt(function(session)
+    local reference, err = paths.file_reference(source, session)
+    if not reference then return nil, err end
+    return build_message(reference)
+  end, on_result)
+end
+
 --- Send the current file path with optional prompt.
 function M.send_file()
-  local file = vim.fn.expand("%:p")
-  if file == "" then
+  local source = paths.capture_source(0)
+  if not source.file then
     vim.notify("No file open", vim.log.levels.WARN)
     return
   end
@@ -390,13 +420,12 @@ function M.send_file()
   vim.ui.input({ prompt = "Pi prompt (file: " .. vim.fn.expand("%:.") .. "): " }, function(input)
     if not input then return end
 
-    local message
-    if input == "" then
-      message = string.format("Look at this file: %s", file)
-    else
-      message = string.format("File: %s\n\n%s", file, input)
-    end
-    M.prompt(message)
+    M.send_file_context(source, function(reference)
+      if input == "" then
+        return string.format("Look at this file: %s", reference)
+      end
+      return string.format("File: %s\n\n%s", reference, input)
+    end)
   end)
 end
 
@@ -413,7 +442,7 @@ function M.send_selection()
     return
   end
 
-  local file = vim.fn.expand("%:.")
+  local source = paths.capture_source(0)
   local start_line = start_pos[2]
   local end_line = end_pos[2]
   local ft = vim.bo.filetype
@@ -421,14 +450,13 @@ function M.send_selection()
   vim.ui.input({ prompt = "Pi prompt (selection): " }, function(input)
     if not input then return end
 
-    local header = string.format("%s lines %d-%d", file, start_line, end_line)
-    local message
-    if input == "" then
-      message = string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, ft, selection)
-    else
-      message = string.format("%s\n\nFrom %s:\n```%s\n%s\n```", input, header, ft, selection)
-    end
-    M.prompt(message)
+    M.send_file_context(source, function(reference)
+      local header = string.format("%s lines %d-%d", reference, start_line, end_line)
+      if input == "" then
+        return string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, ft, selection)
+      end
+      return string.format("%s\n\nFrom %s:\n```%s\n%s\n```", input, header, ft, selection)
+    end)
   end)
 end
 
@@ -436,19 +464,18 @@ end
 function M.send_buffer()
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local content = table.concat(lines, "\n")
-  local file = vim.fn.expand("%:.")
+  local source = paths.capture_source(0)
   local ft = vim.bo.filetype
 
   vim.ui.input({ prompt = "Pi prompt (buffer): " }, function(input)
     if not input then return end
 
-    local message
-    if input == "" then
-      message = string.format("Look at this file %s:\n\n```%s\n%s\n```", file, ft, content)
-    else
-      message = string.format("%s\n\nFile: %s\n```%s\n%s\n```", input, file, ft, content)
-    end
-    M.prompt(message)
+    M.send_file_context(source, function(reference)
+      if input == "" then
+        return string.format("Look at this file %s:\n\n```%s\n%s\n```", reference, ft, content)
+      end
+      return string.format("%s\n\nFile: %s\n```%s\n%s\n```", input, reference, ft, content)
+    end)
   end)
 end
 
@@ -468,9 +495,8 @@ function M.send_diagnostics()
     return a.message < b.message
   end)
 
-  local file = vim.api.nvim_buf_get_name(buf)
-  file = file ~= "" and vim.fn.fnamemodify(file, ":.") or "(unnamed buffer)"
-  local lines = { "Diagnostics for " .. file .. ":" }
+  local source = paths.capture_source(buf)
+  local lines = {}
   if vim.bo[buf].modified then
     table.insert(lines, "These diagnostics are from a buffer with unsaved changes.")
   end
@@ -493,7 +519,10 @@ function M.send_diagnostics()
     ))
   end
 
-  M.prompt(table.concat(lines, "\n"))
+  local text = table.concat(lines, "\n")
+  M.send_file_context(source, function(reference)
+    return "Diagnostics for " .. reference .. ":\n" .. text
+  end)
 end
 
 --- Ping the pi session to check connectivity.
@@ -512,7 +541,7 @@ end
 --- List all running pi sessions (this project's tmp/ and the global
 --- directory, any project) and pin the chosen one.
 function M.list_sessions()
-  local root = project_root(vim.uv.cwd())
+  local root = project_root(vim.fn.getcwd())
   local sessions, seen = {}, {}
   for _, dir in ipairs({ root .. "/tmp", M._global_dir }) do
     for _, session in ipairs(read_sessions(dir)) do

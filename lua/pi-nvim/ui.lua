@@ -1,4 +1,5 @@
 local M = {}
+local paths = require("pi-nvim.paths")
 
 --- Capture visual selection info before it's lost.
 --- @return table|nil
@@ -20,7 +21,8 @@ function M.capture_selection()
 
   return {
     text = text,
-    file = vim.fn.expand("%:."),
+    file = vim.api.nvim_buf_get_name(0),
+    source = paths.capture_source(0),
     start_line = start_pos[2],
     end_line = end_pos[2],
     ft = vim.bo.filetype,
@@ -33,7 +35,7 @@ function M.open(opts)
   opts = opts or {}
   local pi = require("pi-nvim")
   local selection = opts.selection
-  local file = vim.fn.expand("%:p")
+  local source = paths.capture_source(0)
   local rel_file = vim.fn.expand("%:.")
   local ft = vim.bo.filetype
   local send_buffer = false
@@ -148,6 +150,7 @@ function M.open(opts)
   vim.cmd("noautocmd startinsert!")
 
   local closed = false
+  local sending = false
 
   local function close()
     if closed then return end
@@ -173,40 +176,44 @@ function M.open(opts)
   end
 
   local function send()
+    if closed or sending then return end
     local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
     local prompt_text = vim.fn.trim(table.concat(lines, "\n"))
-    close()
-
-    local message
-    if selection then
-      local header = string.format("%s lines %d-%d", selection.file, selection.start_line, selection.end_line)
-      if prompt_text == "" then
-        message = string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, selection.ft, selection.text)
-      else
-        message = string.format("%s\n\nFrom %s:\n```%s\n%s\n```", prompt_text, header, selection.ft, selection.text)
-      end
-    elseif send_buffer and rel_file ~= "" then
-      local content = table.concat(buf_lines, "\n")
-      if prompt_text == "" then
-        message = string.format("Look at this file %s:\n\n```%s\n%s\n```", rel_file, ft, content)
-      else
-        message = string.format("%s\n\nFile: %s\n```%s\n%s\n```", prompt_text, rel_file, ft, content)
-      end
-    elseif file ~= "" then
-      if prompt_text == "" then
-        message = string.format("Look at this file: %s", file)
-      else
-        message = string.format("File: %s\n\n%s", file, prompt_text)
-      end
-    else
-      if prompt_text == "" then
-        vim.notify("Nothing to send", vim.log.levels.WARN)
-        return
-      end
-      message = prompt_text
+    sending = true
+    local function on_result(err)
+      sending = false
+      if not err then close() end
     end
 
-    pi.prompt(message)
+    if not selection and not source.file and not send_buffer then
+      if prompt_text == "" then
+        sending = false
+        vim.notify("Nothing to send", vim.log.levels.WARN)
+      else
+        pi.prompt(prompt_text, on_result)
+      end
+      return
+    end
+
+    local context = selection and (selection.source or selection.file) or source
+    pi.send_file_context(context, function(reference)
+      if selection then
+        local header = string.format("%s lines %d-%d", reference, selection.start_line, selection.end_line)
+        if prompt_text == "" then
+          return string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, selection.ft, selection.text)
+        end
+        return string.format("%s\n\nFrom %s:\n```%s\n%s\n```", prompt_text, header, selection.ft, selection.text)
+      elseif send_buffer then
+        local content = table.concat(buf_lines, "\n")
+        if prompt_text == "" then
+          return string.format("Look at this file %s:\n\n```%s\n%s\n```", reference, ft, content)
+        end
+        return string.format("%s\n\nFile: %s\n```%s\n%s\n```", prompt_text, reference, ft, content)
+      elseif prompt_text == "" then
+        return string.format("Look at this file: %s", reference)
+      end
+      return string.format("File: %s\n\n%s", reference, prompt_text)
+    end, on_result)
   end
 
   local kopts = { buffer = input_buf, noremap = true, silent = true }

@@ -21,7 +21,13 @@ local function eq(expected, actual, what)
   end
 end
 
+local session = { local_root = root, remote_root = root }
 local function capture_prompt(message)
+  if type(message) == "function" then
+    local text, err = message(session)
+    assert(text, err)
+    message = text
+  end
   table.insert(messages, message)
 end
 
@@ -86,7 +92,7 @@ test(":PiSendDiagnostics sends all severities and namespaces from only the curre
   vim.cmd.PiSendDiagnostics()
 
   eq({ table.concat({
-    "Diagnostics for example.lua:",
+    "Diagnostics for " .. root .. "/example.lua:",
     "1:1 ERROR [lua_ls 123]: Error",
     "2:1 INFO: Information",
     "2:4 WARN [lint W001]: Warning",
@@ -118,7 +124,7 @@ test("missing or empty metadata is omitted and numeric code zero is preserved", 
   pi.send_diagnostics()
 
   eq(table.concat({
-    "Diagnostics for example.lua:",
+    "Diagnostics for " .. root .. "/example.lua:",
     "1:1 ERROR: No metadata",
     "2:1 ERROR [lint]: Source only",
     "3:1 ERROR [0]: Code only",
@@ -137,7 +143,7 @@ test("diagnostics at the same position are sorted by severity then message", fun
   pi.send_diagnostics()
 
   eq(table.concat({
-    "Diagnostics for example.lua:",
+    "Diagnostics for " .. root .. "/example.lua:",
     "1:1 ERROR: A error",
     "1:1 ERROR: Z error",
     "1:1 WARN: Warning",
@@ -152,7 +158,7 @@ test("multiline diagnostic messages are preserved and indented", function()
 
   pi.send_diagnostics()
 
-  eq("Diagnostics for example.lua:\n1:1 ERROR: Type mismatch\n  Expected number\n  Got string", messages[1], "multiline message")
+  eq("Diagnostics for " .. root .. "/example.lua:\n1:1 ERROR: Type mismatch\n  Expected number\n  Got string", messages[1], "multiline message")
 end)
 
 test("unnamed buffers can send diagnostics", function()
@@ -174,7 +180,7 @@ test("unsaved changes are identified without including buffer contents", functio
   pi.send_diagnostics()
 
   eq(table.concat({
-    "Diagnostics for example.lua:",
+    "Diagnostics for " .. root .. "/example.lua:",
     "These diagnostics are from a buffer with unsaved changes.",
     "1:1 ERROR: Unsaved diagnostic",
   }, "\n"), messages[1], "unsaved buffer")
@@ -188,13 +194,13 @@ test("the command uses the existing prompt transport", function()
   local payload
   pi.prompt = original_prompt
   pi.send_raw = function(message, callback)
-    payload = message
+    payload = type(message) == "function" and message(session) or message
     callback(nil, { ok = true })
   end
 
   vim.cmd.PiSendDiagnostics()
 
-  eq({ type = "prompt", message = "Diagnostics for example.lua:\n1:1 ERROR: Transport diagnostic" }, payload, "prompt payload")
+  eq({ type = "prompt", message = "Diagnostics for " .. root .. "/example.lua:\n1:1 ERROR: Transport diagnostic" }, payload, "prompt payload")
 end)
 
 vim.diagnostic.reset()
