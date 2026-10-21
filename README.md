@@ -52,15 +52,23 @@ Start pi in one terminal (or container) and Neovim in another, both in the same 
 
 ### Commands
 
-| Command            | Description                                                  |
-| ------------------ | ------------------------------------------------------------ |
-| `:Pi`              | Open the Send to pi dialog (works in normal and visual mode) |
-| `:PiSend`          | Type a prompt and send to pi                                 |
-| `:PiSendFile`      | Send current file path + prompt                              |
-| `:PiSendSelection` | Send visual selection + prompt                               |
-| `:PiSendBuffer`    | Send entire buffer + prompt                                  |
-| `:PiPing`          | Check if pi is reachable                                     |
-| `:PiSessions`      | List running pi sessions (see Session discovery) and pin one |
+| Command              | Description                                                  |
+| -------------------- | ------------------------------------------------------------ |
+| `:Pi`                | Open the Send to pi dialog (works in normal and visual mode)  |
+| `:PiSend`            | Type a prompt and send to pi                                  |
+| `:PiSendFile`        | Send current file path + prompt                               |
+| `:PiSendSelection`   | Send visual selection + prompt                                |
+| `:PiSendBuffer`      | Send entire buffer + prompt                                   |
+| `:PiSendDiagnostics` | Send diagnostics from the current buffer without a dialog     |
+| `:PiPing`            | Check if pi is reachable                                      |
+| `:PiSessions`        | List running pi sessions (see Session discovery) and pin one  |
+
+`:PiSendDiagnostics` sends all diagnostic severities and sources known to Neovim
+for the current buffer only. The message includes the file name, one-based line
+and column, severity, source and diagnostic code (when available), and diagnostic
+text, sorted by position. It does not send buffer contents or run a new analysis.
+If the buffer has unsaved changes, the message notes that; if it has no
+diagnostics, the command notifies you without sending anything to pi.
 
 ### Default keybindings
 
@@ -91,6 +99,7 @@ vim.keymap.set("n", "<leader>pp", ":PiSend<CR>")
 vim.keymap.set("n", "<leader>pf", ":PiSendFile<CR>")
 vim.keymap.set("v", "<leader>ps", ":PiSendSelection<CR>")
 vim.keymap.set("n", "<leader>pb", ":PiSendBuffer<CR>")
+vim.keymap.set("n", "<leader>pd", ":PiSendDiagnostics<CR>")
 vim.keymap.set("n", "<leader>pi", ":PiPing<CR>")
 ```
 
@@ -121,6 +130,7 @@ echo '{"type":"prompt","message":"hello"}' | socat - UNIX-CONNECT:tmp/<hash>-<pi
 
 ```sh
 nvim --clean --headless -l tests/discovery_spec.lua
+nvim --clean --headless -l tests/diagnostics_spec.lua
 ```
 
 ## License

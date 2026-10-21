@@ -80,6 +80,10 @@ function M.setup(opts)
     M.send_buffer()
   end, { desc = "Send entire buffer to pi with a prompt" })
 
+  vim.api.nvim_create_user_command("PiSendDiagnostics", function()
+    M.send_diagnostics()
+  end, { desc = "Send current buffer diagnostics to pi" })
+
   vim.api.nvim_create_user_command("Pi", function(args)
     local ui = require("pi-nvim.ui")
     local selection = nil
@@ -446,6 +450,50 @@ function M.send_buffer()
     end
     M.prompt(message)
   end)
+end
+
+--- Send all current buffer diagnostics without opening a dialog.
+function M.send_diagnostics()
+  local buf = vim.api.nvim_get_current_buf()
+  local diagnostics = vim.diagnostic.get(buf)
+  if #diagnostics == 0 then
+    vim.notify("No diagnostics in current buffer", vim.log.levels.INFO)
+    return
+  end
+
+  table.sort(diagnostics, function(a, b)
+    if a.lnum ~= b.lnum then return a.lnum < b.lnum end
+    if a.col ~= b.col then return a.col < b.col end
+    if a.severity ~= b.severity then return a.severity < b.severity end
+    return a.message < b.message
+  end)
+
+  local file = vim.api.nvim_buf_get_name(buf)
+  file = file ~= "" and vim.fn.fnamemodify(file, ":.") or "(unnamed buffer)"
+  local lines = { "Diagnostics for " .. file .. ":" }
+  if vim.bo[buf].modified then
+    table.insert(lines, "These diagnostics are from a buffer with unsaved changes.")
+  end
+
+  for _, diagnostic in ipairs(diagnostics) do
+    local details = {}
+    if diagnostic.source and diagnostic.source ~= "" then
+      table.insert(details, diagnostic.source)
+    end
+    if diagnostic.code ~= nil and tostring(diagnostic.code) ~= "" then
+      table.insert(details, tostring(diagnostic.code))
+    end
+    local origin = #details > 0 and " [" .. table.concat(details, " ") .. "]" or ""
+    table.insert(lines, string.format("%d:%d %s%s: %s",
+      diagnostic.lnum + 1,
+      diagnostic.col + 1,
+      vim.diagnostic.severity[diagnostic.severity],
+      origin,
+      (diagnostic.message:gsub("\n", "\n  "))
+    ))
+  end
+
+  M.prompt(table.concat(lines, "\n"))
 end
 
 --- Ping the pi session to check connectivity.
