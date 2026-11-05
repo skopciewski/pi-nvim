@@ -42,14 +42,15 @@ end
 
 --- @class pi_nvim.Config
 --- @field socket_path string|nil  Fixed socket path; disables discovery (default: nil)
---- @field set_default_keymaps boolean|nil  Whether to create the default <leader>p mappings (default: true)
 M.config = {
   socket_path = nil,
-  set_default_keymaps = true,
 }
 
 --- @param opts pi_nvim.Config|nil
 function M.setup(opts)
+  for option in pairs(opts or {}) do
+    if option ~= "socket_path" then error("Unknown pi-nvim option: " .. tostring(option)) end
+  end
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
   -- Auto-reload buffers when files are changed externally (e.g. by pi agent).
@@ -65,40 +66,32 @@ function M.setup(opts)
   end))
 
   -- Commands
-  vim.api.nvim_create_user_command("PiSend", function()
-    M.prompt()
-  end, { desc = "Send a prompt to pi" })
+  vim.api.nvim_create_user_command("PiSelection", function(args)
+    local dialog = require("pi-nvim.dialog")
+    local context = dialog.capture_selection(args)
+    if context then dialog.open(context) end
+  end, { range = true, desc = "Insert or submit a selection to the displayed pi session" })
 
-  vim.api.nvim_create_user_command("PiSendFile", function()
-    M.send_file()
-  end, { desc = "Send current file to pi with a prompt" })
+  vim.api.nvim_create_user_command("PiFile", function()
+    local dialog = require("pi-nvim.dialog")
+    local context = dialog.capture_file()
+    if context then dialog.open(context) end
+  end, { desc = "Insert or submit a file reference to the displayed pi session" })
 
-  vim.api.nvim_create_user_command("PiSendSelection", function()
-    M.send_selection()
-  end, { range = true, desc = "Send visual selection to pi with a prompt" })
+  vim.api.nvim_create_user_command("PiBuffer", function()
+    local dialog = require("pi-nvim.dialog")
+    dialog.open(dialog.capture_buffer())
+  end, { desc = "Insert or submit the whole buffer to the displayed pi session" })
 
-  vim.api.nvim_create_user_command("PiSendBuffer", function()
-    M.send_buffer()
-  end, { desc = "Send entire buffer to pi with a prompt" })
+  vim.api.nvim_create_user_command("PiDiagnostics", function()
+    local dialog = require("pi-nvim.dialog")
+    local context = dialog.capture_diagnostics()
+    if context then dialog.open(context) end
+  end, { desc = "Insert or submit current buffer diagnostics to the displayed pi session" })
 
-  vim.api.nvim_create_user_command("PiSendDiagnostics", function()
-    M.send_diagnostics()
-  end, { desc = "Send current buffer diagnostics to pi" })
-
-  vim.api.nvim_create_user_command("Pi", function(args)
-    local ui = require("pi-nvim.ui")
-    local selection = nil
-    if args.range == 2 then
-      selection = ui.capture_selection()
-    end
-    ui.open({ selection = selection })
-  end, { range = true, desc = "Open pi send dialog" })
-
-  if M.config.set_default_keymaps then
-    -- Default keymap: <leader>p in normal and visual mode
-    vim.keymap.set("n", "<leader>p", ":Pi<CR>", { silent = true, desc = "Send to pi" })
-    vim.keymap.set("v", "<leader>p", ":Pi<CR>", { silent = true, desc = "Send selection to pi" })
-  end
+  vim.api.nvim_create_user_command("PiPrompt", function()
+    require("pi-nvim.dialog").open({ kind = "prompt" })
+  end, { desc = "Submit a prompt without file context to the displayed pi session" })
 
   vim.api.nvim_create_user_command("PiPing", function()
     M.ping()
@@ -212,7 +205,8 @@ end
 --- @return string|nil
 function M.get_socket_path()
   if M.config.socket_path then
-    return M.config.socket_path
+    if vim.uv.fs_stat(M.config.socket_path) then return M.config.socket_path end
+    return nil
   end
 
   if M.state.pinned then
@@ -272,12 +266,12 @@ local function forget(socket, err, refused)
   return true
 end
 
---- Send a raw JSON message to the pi socket and call cb with the parsed response.
 --- @param msg table|fun(session: pi_nvim.Session): table|nil, string|nil
 --- @param cb fun(err: string|nil, response: table|nil)|nil
---- @param _retried boolean|nil  internal: a failed connect is retried once
-function M.send_raw(msg, cb, _retried)
-  local session = M.get_session()
+--- @param opts pi_nvim.DeliveryOptions
+--- @param retried boolean|nil
+local function send_raw(msg, cb, opts, retried)
+  local session = opts.session or M.get_session()
   if not session then
     local err = "No pi session found. Start pi with the pi-nvim extension and create <checkout>/tmp before starting pi in a container."
     vim.notify(err, vim.log.levels.ERROR)
@@ -314,9 +308,10 @@ function M.send_raw(msg, cb, _retried)
     if err then
       client:close()
       vim.schedule(function()
-        -- Always forget the failed socket; retry with a new lookup only once.
-        if forget(sock_path, err, before_connect) and not _retried then
-          M.send_raw(msg, cb, true)
+        -- Cleanup applies to bound targets too, but they must never be redirected.
+        local retry = forget(sock_path, err, before_connect)
+        if retry and not opts.session and not retried then
+          send_raw(msg, cb, opts, true)
           return
         end
         vim.notify("Failed to connect to pi: " .. err, vim.log.levels.ERROR)
@@ -347,7 +342,7 @@ function M.send_raw(msg, cb, _retried)
           client:close()
           vim.schedule(function()
             local ok, resp = pcall(vim.json.decode, line)
-            if ok and resp then
+            if ok and type(resp) == "table" then
               if cb then cb(nil, resp) end
             else
               vim.notify("Invalid response from pi", vim.log.levels.ERROR)
@@ -367,162 +362,56 @@ function M.send_raw(msg, cb, _retried)
   end)
 end
 
---- Send a prompt through the selected session's socket.
+--- Send a raw JSON message to the pi socket and call cb with the parsed response.
+--- @param msg table|fun(session: pi_nvim.Session): table|nil, string|nil
+--- @param cb fun(err: string|nil, response: table|nil)|nil
+--- @param opts pi_nvim.DeliveryOptions|nil  Only session applies to raw requests
+function M.send_raw(msg, cb, opts)
+  send_raw(msg, cb, opts or {})
+end
+
+--- @class pi_nvim.DeliveryOptions
+--- @field mode "submit"|"insert"|nil  Submit by default; insert appends to pi's editor
+--- @field session pi_nvim.Session|nil  Deliver only to this target, without retry
+
+--- Deliver a message through the selected session's socket.
 --- @param message string|fun(session: pi_nvim.Session): string|nil, string|nil
 --- @param on_result fun(err: string|nil, response: table|nil)|nil
-function M.prompt(message, on_result)
-  if message then
-    local request = { type = "prompt", message = message }
-    if type(message) == "function" then
-      request = function(session)
-        local text, err = message(session)
-        if not text then return nil, err end
-        return { type = "prompt", message = text }
+--- @param opts pi_nvim.DeliveryOptions|nil
+function M.prompt(message, on_result, opts)
+  assert(type(message) == "string" or type(message) == "function", "pi-nvim.prompt requires a message")
+  opts = opts or {}
+  local inserting = opts.mode == "insert"
+  local request_type = inserting and "insert" or "prompt"
+  local request = { type = request_type, message = message }
+  if type(message) == "function" then
+    request = function(session)
+      local text, err = message(session)
+      if not text then return nil, err end
+      return { type = request_type, message = text }
+    end
+  end
+  M.send_raw(request, function(err, resp)
+    if not err then
+      if resp and resp.ok then
+        vim.notify(inserting and "Inserted into pi editor" or "Sent to pi", vim.log.levels.INFO)
+      else
+        err = "pi error: " .. (resp and resp.error or "unknown")
+        vim.notify(err, vim.log.levels.ERROR)
       end
     end
-    M.send_raw(request, function(err, resp)
-      if not err then
-        if resp and resp.ok then
-          vim.notify("Sent to pi", vim.log.levels.INFO)
-        else
-          err = "pi error: " .. (resp and resp.error or "unknown")
-          vim.notify(err, vim.log.levels.ERROR)
-        end
-      end
-      if on_result then on_result(err, resp) end
-    end)
-  else
-    vim.ui.input({ prompt = "Pi prompt: " }, function(input)
-      if input and input ~= "" then
-        M.prompt(input, on_result)
-      end
-    end)
-  end
+    if on_result then on_result(err, resp) end
+  end, opts)
 end
 
 --- Build file context after selecting the target, including on connection retries.
-function M.send_file_context(source, build_message, on_result)
+--- @param opts pi_nvim.DeliveryOptions|nil
+function M.send_file_context(source, build_message, on_result, opts)
   M.prompt(function(session)
     local reference, err = paths.file_reference(source, session)
     if not reference then return nil, err end
     return build_message(reference)
-  end, on_result)
-end
-
---- Send the current file path with optional prompt.
-function M.send_file()
-  local source = paths.capture_source(0)
-  if not source.file then
-    vim.notify("No file open", vim.log.levels.WARN)
-    return
-  end
-
-  vim.ui.input({ prompt = "Pi prompt (file: " .. vim.fn.expand("%:.") .. "): " }, function(input)
-    if not input then return end
-
-    M.send_file_context(source, function(reference)
-      if input == "" then
-        return string.format("Look at this file: %s", reference)
-      end
-      return string.format("File: %s\n\n%s", reference, input)
-    end)
-  end)
-end
-
---- Send the visual selection with a prompt.
-function M.send_selection()
-  -- Get the visual selection
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
-  local lines = vim.fn.getregion(start_pos, end_pos, { type = vim.fn.visualmode() })
-  local selection = table.concat(lines, "\n")
-
-  if selection == "" then
-    vim.notify("Empty selection", vim.log.levels.WARN)
-    return
-  end
-
-  local source = paths.capture_source(0)
-  local start_line = start_pos[2]
-  local end_line = end_pos[2]
-  local ft = vim.bo.filetype
-
-  vim.ui.input({ prompt = "Pi prompt (selection): " }, function(input)
-    if not input then return end
-
-    M.send_file_context(source, function(reference)
-      local header = string.format("%s lines %d-%d", reference, start_line, end_line)
-      if input == "" then
-        return string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, ft, selection)
-      end
-      return string.format("%s\n\nFrom %s:\n```%s\n%s\n```", input, header, ft, selection)
-    end)
-  end)
-end
-
---- Send the entire buffer contents with a prompt.
-function M.send_buffer()
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  local content = table.concat(lines, "\n")
-  local source = paths.capture_source(0)
-  local ft = vim.bo.filetype
-
-  vim.ui.input({ prompt = "Pi prompt (buffer): " }, function(input)
-    if not input then return end
-
-    M.send_file_context(source, function(reference)
-      if input == "" then
-        return string.format("Look at this file %s:\n\n```%s\n%s\n```", reference, ft, content)
-      end
-      return string.format("%s\n\nFile: %s\n```%s\n%s\n```", input, reference, ft, content)
-    end)
-  end)
-end
-
---- Send all current buffer diagnostics without opening a dialog.
-function M.send_diagnostics()
-  local buf = vim.api.nvim_get_current_buf()
-  local diagnostics = vim.diagnostic.get(buf)
-  if #diagnostics == 0 then
-    vim.notify("No diagnostics in current buffer", vim.log.levels.INFO)
-    return
-  end
-
-  table.sort(diagnostics, function(a, b)
-    if a.lnum ~= b.lnum then return a.lnum < b.lnum end
-    if a.col ~= b.col then return a.col < b.col end
-    if a.severity ~= b.severity then return a.severity < b.severity end
-    return a.message < b.message
-  end)
-
-  local source = paths.capture_source(buf)
-  local lines = {}
-  if vim.bo[buf].modified then
-    table.insert(lines, "These diagnostics are from a buffer with unsaved changes.")
-  end
-
-  for _, diagnostic in ipairs(diagnostics) do
-    local details = {}
-    if diagnostic.source and diagnostic.source ~= "" then
-      table.insert(details, diagnostic.source)
-    end
-    if diagnostic.code ~= nil and tostring(diagnostic.code) ~= "" then
-      table.insert(details, tostring(diagnostic.code))
-    end
-    local origin = #details > 0 and " [" .. table.concat(details, " ") .. "]" or ""
-    table.insert(lines, string.format("%d:%d %s%s: %s",
-      diagnostic.lnum + 1,
-      diagnostic.col + 1,
-      vim.diagnostic.severity[diagnostic.severity],
-      origin,
-      (diagnostic.message:gsub("\n", "\n  "))
-    ))
-  end
-
-  local text = table.concat(lines, "\n")
-  M.send_file_context(source, function(reference)
-    return "Diagnostics for " .. reference .. ":\n" .. text
-  end)
+  end, on_result, opts)
 end
 
 --- Ping the pi session to check connectivity.

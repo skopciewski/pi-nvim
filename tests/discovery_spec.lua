@@ -281,6 +281,26 @@ test("files not named by the extension are never removed", function()
   assert(uv.fs_stat(foreign .. ".info"), "foreign manifest kept")
 end)
 
+test("a missing configured path means no session, without falling back to discovery or a pin", function()
+  local pi = fresh()
+  vim.fn.mkdir(root .. "/tmp")
+  local alive = root .. "/tmp/aaaaaaaaaaaa-1.sock"
+  serve(alive); manifest(alive, root, 1)
+  pi.state.pinned = alive
+  pi.config.socket_path = root .. "/tmp/missing.sock"
+  eq(nil, pi.get_socket_path(), "missing configured socket")
+  eq(nil, pi.get_session(), "missing configured session")
+  eq(alive, pi.state.pinned, "pin untouched")
+end)
+
+test("an existing configured path need not be a socket to resolve a target", function()
+  local pi = fresh()
+  pi.config.socket_path = root .. "/ordinary-file"
+  vim.fn.writefile({}, pi.config.socket_path)
+  eq(pi.config.socket_path, pi.get_socket_path(), "existing file")
+  eq({ socket = pi.config.socket_path }, pi.get_session(), "target without manifest")
+end)
+
 test("config.socket_path is used as-is and never cleaned up", function()
   local pi = fresh()
   vim.fn.mkdir(root .. "/tmp")
